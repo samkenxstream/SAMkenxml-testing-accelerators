@@ -13,6 +13,7 @@
 // limitations under the License.
 
 local common = import 'common.libsonnet';
+local mixins = import 'templates/mixins.libsonnet';
 local timeouts = import 'templates/timeouts.libsonnet';
 local tpus = import 'templates/tpus.libsonnet';
 local utils = import 'templates/utils.libsonnet';
@@ -33,7 +34,8 @@ local utils = import 'templates/utils.libsonnet';
     --config-dir fairseq/examples/wav2vec/config/pretraining   \
     --config-name wav2vec2_large_librivox_tpu.yaml \
   |||,
-  local w2v2 = common.PyTorchTest {
+  local w2v2 = self.w2v2,
+  w2v2:: common.PyTorchTest {
     modelName: 'w2v2',
 
     volumeMap+: {
@@ -42,12 +44,14 @@ local utils = import 'templates/utils.libsonnet';
     cpu: '9.0',
     memory: '30Gi',
   },
-  local func = common.Functional {
+  local func = self.func,
+  func:: common.Functional {
     command: utils.scriptCommand(
       command_common % 500
     ),
   },
-  local conv = common.Convergence {
+  local conv = self.conv,
+  conv:: common.Convergence {
     command: utils.scriptCommand(
       (command_common % 50000) + |||
         2>&1 | tee training_logs.txt
@@ -61,11 +65,27 @@ local utils = import 'templates/utils.libsonnet';
 
     ),
   },
-  local v3_8 = {
+  local tpuVm = self.tpuVm,
+  tpuVm:: common.PyTorchTpuVmMixin {
+    tpuSettings+: {
+      tpuVmExports+: |||
+        export XLA_USE_BF16=$(XLA_USE_BF16)
+      |||,
+      tpuVmExtraSetup: |||
+        pip install tensorboardX google-cloud-storage
+        git clone --recursive https://github.com/pytorch-tpu/examples.git tpu-examples/
+        pip install --editable ./tpu-examples/deps/fairseq
+        echo 'export PATH=~/.local/bin:$PATH' >> ~/.bash_profile
+        echo 'export XLA_USE_BF16=1' >> ~/.bash_profile
+      |||,
+    },
+  },
+  local v3_8 = self.v3_8,
+  v3_8:: {
     accelerator: tpus.v3_8,
   },
   configs: [
-    w2v2 + v3_8 + func + timeouts.Hours(2),
-    w2v2 + v3_8 + conv + timeouts.Hours(20),
+    w2v2 + v3_8 + func + timeouts.Hours(2) + tpuVm + mixins.Experimental,
+    w2v2 + v3_8 + conv + timeouts.Hours(20) + tpuVm + mixins.Experimental,
   ],
 }

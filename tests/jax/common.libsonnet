@@ -67,65 +67,20 @@ local tpus = import 'templates/tpus.libsonnet';
       |||
         set -x
         set -u
-        ssh -i scripts/id_rsa -o StrictHostKeyChecking=no \
-            xl-ml-test@$(cat /scripts/tpu_ip) << 'TEST_SCRIPT_EOF'
-          %s
+
+        cat > testsetup.sh << 'TEST_SCRIPT_EOF'
+        %s
         TEST_SCRIPT_EOF
+
+        gcloud alpha compute tpus tpu-vm ssh xl-ml-test@$(cat /scripts/tpu_name) \
+        --zone=$(cat /scripts/zone) \
+        --ssh-key-file=/scripts/id_rsa \
+        --strict-host-key-checking=no \
+        --internal-ip \
+        --worker=all \
+        --command "$(cat testsetup.sh)"
+
         exit_code=$?
-        bash /scripts/cleanup.sh
-        exit $exit_code
-      ||| % config.testScript,
-    ],
-  },
-
-  JaxPodTest:: self.JaxTest {
-    local config = self,
-
-    accelerator: tpus.v2_32,
-
-    // Execute testScript on every host in the pod slice.
-    command: [
-      'bash',
-      '-c',
-      |||
-        set -u
-        # Asynchronously run testScript on each host via ssh, log each host's
-        # output, and collect process IDs.
-        pids=()
-        for tpu_ip in $(cat /scripts/all_tpu_ips)
-        do
-          echo "Starting test script on TPU host $tpu_ip..."
-          ssh -i scripts/id_rsa -o StrictHostKeyChecking=no xl-ml-test@$tpu_ip \
-              > /tmp/$tpu_ip.log 2>&1 <<'TEST_SCRIPT_EOF' &
-            %s
-        TEST_SCRIPT_EOF
-          pids+=( $! )
-          echo "pid: ${pids[-1]}"
-        done
-
-        # Wait for each host's ssh process to complete and collect exit codes.
-        # We'll return an error if any process failed.
-        exit_code=0
-        for pid in ${pids[@]}
-        do
-          echo "Waiting for pid $pid to complete..."
-          wait $pid
-          pid_exit_code=$?
-          echo "exit code: $pid_exit_code"
-          if [ "$pid_exit_code" -ne "0" ]
-          then
-            exit_code=$pid_exit_code
-          fi
-        done
-
-        # Output each host's log so it shows up in the GKE logs.
-        for tpu_ip in $(cat /scripts/all_tpu_ips)
-        do
-          echo "========== output for TPU host $tpu_ip =========="
-          cat /tmp/$tpu_ip.log
-          echo "========== end of output for TPU host $tpu_ip =========="
-        done
-
         bash /scripts/cleanup.sh
         exit $exit_code
       ||| % config.testScript,
@@ -148,13 +103,13 @@ local tpus = import 'templates/tpus.libsonnet';
       installLatestJax: 'pip install jax',
       maybeBuildJaxlib: |||
         echo "Installing latest jaxlib-nightly..."
-        pip install jaxlib-nightly \
+        pip install --pre jaxlib \
           -f https://storage.googleapis.com/jax-releases/jaxlib_nightly_releases.html
         pip list | grep jaxlib
         python3 -c 'import jaxlib; print("jaxlib version:", jaxlib.__version__)'
 
         echo "Installing latest libtpu-nightly..."
-        pip install libtpu-nightly \
+        pip install libtpu-nightly --no-index --pre \
           -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
       |||,
     },
@@ -209,6 +164,36 @@ local tpus = import 'templates/tpus.libsonnet';
     scriptConfig+: {
       testEnvWorkarounds: |||
         pip install tensorflow
+      |||,
+    },
+  },
+
+  huggingFace:: {
+    scriptConfig+: {
+      installPackages: |||
+        set -x
+        set -u
+        set -e
+
+        # .bash_logout sometimes causes a spurious bad exit code, remove it.
+        rm .bash_logout
+
+        pip install --upgrade pip
+        git clone https://github.com/huggingface/transformers.git
+        cd transformers && pip install .
+        pip install -r examples/flax/_tests_requirements.txt
+        pip install --upgrade huggingface-hub urllib3 zipp
+
+        pip install tensorflow
+        pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+      |||,
+      verifySetup: |||
+        python3 -c 'import flax; print("flax version:", flax.__version__)'
+        num_devices=`python3 -c "import jax; print(jax.device_count())"`
+        if [ "$num_devices" = "1" ]; then
+          echo "No TPU devices detected"
+          exit 1
+        fi
       |||,
     },
   },

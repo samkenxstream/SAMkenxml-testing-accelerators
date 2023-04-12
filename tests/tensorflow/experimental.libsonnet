@@ -42,11 +42,11 @@ local mixins = import 'templates/mixins.libsonnet';
               |||
                 set -x
                 set -u
-                ssh -i scripts/id_rsa -o StrictHostKeyChecking=no xl-ml-test@$(cat /scripts/tpu_ip) \
+                gcloud alpha compute tpus tpu-vm ssh xl-ml-test@$(cat /scripts/tpu_name) --zone=$(cat /scripts/zone) --ssh-key-file=/scripts/id_rsa --strict-host-key-checking=no --internal-ip --command \
                   'pip install -r /usr/share/tpu/models/official/requirements.txt'
-                ssh -i scripts/id_rsa -o StrictHostKeyChecking=no xl-ml-test@$(cat /scripts/tpu_ip) \
+                gcloud alpha compute tpus tpu-vm ssh xl-ml-test@$(cat /scripts/tpu_name) --zone=$(cat /scripts/zone) --ssh-key-file=/scripts/id_rsa --strict-host-key-checking=no --internal-ip --command \
                   'pip install tensorflow-recommenders --no-deps'
-                ssh -i scripts/id_rsa -o StrictHostKeyChecking=no xl-ml-test@$(cat /scripts/tpu_ip) \
+                gcloud alpha compute tpus tpu-vm ssh xl-ml-test@$(cat /scripts/tpu_name) --zone=$(cat /scripts/zone) --ssh-key-file=/scripts/id_rsa --strict-host-key-checking=no --internal-ip --command \
                   'cd /usr/share/tpu/models; %(env)s '%(testCommand)s
                 exit_code=$?
                 bash /scripts/cleanup.sh
@@ -118,46 +118,6 @@ local mixins = import 'templates/mixins.libsonnet';
                 bash /scripts/cleanup.sh
                 exit $exit_code
               ||| % remoteScript,
-            ],
-          },
-        },
-      },
-    },
-  },
-  TensorflowServingTpuVmMixin:: experimental.BaseTpuVmTest {
-    local config = self,
-    local image = error 'must supply base `image`.',
-    tpuSettings+: {
-      tpuVmStartupScript: 'gcloud auth configure-docker && ' +
-                          'mkdir -p /models/%(model)s && ' % config.servingConfig +
-                          'gsutil -m cp -R %(gcsDir)s/* /models/%(model)s && ' % config.servingConfig +
-                          'docker run -d --privileged -e MODEL_NAME=%(model)s -e TPU_MIN_LOG_LEVEL=0 -p 8500:8500 -v "/models:/models" -v "/lib/libtpu.so:/lib/libtpu.so" %(modelServerImage)s' % config.servingConfig,
-      tpuVmCreateSleepSeconds: 120,
-    },
-
-    podTemplate+: {
-      spec+: {
-        containerMap+:: {
-          train+: {
-            local scriptSettings = {
-              testCommand:
-                std.join(
-                  ' ',
-                  config.command,
-                ),
-            },
-            command: [
-              'bash',
-              '-c',
-              |||
-                set -x
-                set -u
-
-                %(testCommand)s
-                exit_code=$?
-                bash /scripts/cleanup.sh
-                exit $exit_code
-              ||| % scriptSettings,
             ],
           },
         },

@@ -43,6 +43,18 @@ local utils = import 'templates/utils.libsonnet';
           super.tpuVmCreateSleepSeconds
         else
           180,
+      tpuVmXlaDistPrefix:
+        if config.accelerator.replicas == 1 then
+          null
+        else
+          [
+            'python3',
+            '-m',
+            'torch_xla.distributed.xla_dist',
+            '--tpu=tpu-$(POD_UID)',
+            '--',
+          ],
+      tpuVmMainCommandWorkers: '0',
     },
     podTemplate+:: {
       spec+: {
@@ -51,18 +63,13 @@ local utils = import 'templates/utils.libsonnet';
           train+: {
             local scriptSettings = {
               // Distribute command with xla_dist on pods
-              testCommand: if config.accelerator.replicas == 1 then
+              testCommand: if config.tpuSettings.tpuVmXlaDistPrefix == null then
                 utils.toCommandString(config.command)
               else
                 utils.toCommandString(
-                  [
-                    'python3',
-                    '-m',
-                    'torch_xla.distributed.xla_dist',
-                    '--tpu=tpu-$(POD_UID)',
-                    '--',
-                  ] + config.command,
+                  config.tpuSettings.tpuVmXlaDistPrefix + config.command
                 ),
+              commandWorkers: config.tpuSettings.tpuVmMainCommandWorkers,
               pytorchSetup: config.tpuSettings.tpuVmPytorchSetup,
               extraSetup: config.tpuSettings.tpuVmExtraSetup,
               exports: config.tpuSettings.tpuVmExports,
@@ -79,6 +86,9 @@ local utils = import 'templates/utils.libsonnet';
 
                 cat > workersetup.sh << TEST_SCRIPT_EOF
                 sudo apt-get -y update
+                // Ensure lock is released after udpate
+                sudo kill -9 $(lsof /var/lib/dpkg/lock-frontend | awk '{print $2}')
+                sudo dpkg --configure -a
                 sudo apt-get -y install nfs-common
                 sudo mkdir /datasets && sudo mount $(PYTORCH_DATA_LOCATION) /datasets
 
@@ -96,7 +106,7 @@ local utils = import 'templates/utils.libsonnet';
                 %(exports)s
                 %(testCommand)s
                 TEST_SCRIPT_EOF
-                gcloud alpha compute tpus tpu-vm ssh xl-ml-test@$(cat /scripts/tpu_name) --zone=$(cat /scripts/zone) --ssh-key-file=/scripts/id_rsa --strict-host-key-checking=no --internal-ip --worker=0 --command "$(cat testscript.sh)"
+                gcloud alpha compute tpus tpu-vm ssh xl-ml-test@$(cat /scripts/tpu_name) --zone=$(cat /scripts/zone) --ssh-key-file=/scripts/id_rsa --strict-host-key-checking=no --internal-ip --worker=%(commandWorkers)s --command "$(cat testscript.sh)"
 
                 exit_code=$?
                 bash /scripts/cleanup.sh
@@ -111,339 +121,10 @@ local utils = import 'templates/utils.libsonnet';
   PjRt:: {
     tpuSettings+: {
       tpuVmExports: |||
-        export PJRT_DEVICE=TPU
+        export PJRT_DEVICE=TPU_C_API
       |||,
-    },
-  },
-
-  // *TpuVmPodTest is deprecated. Use PyTorchTpuVmMixin instead
-  PyTorchTpuVmPodTest:: experimental.BaseTpuVmMixin {
-    local config = self,
-    tpuSettings+: {
-      tpuVmStartupScript: |||
-        #! /bin/bash
-        cd /usr/share
-        git clone https://github.com/pytorch/xla.git -b r1.8.1
-        sudo apt-get -y update
-        sudo apt-get -y install nfs-common
-        sudo mkdir /datasets
-        sudo mount 10.182.107.26:/pytorch_datasets /datasets
-        echo Done XLA startup script
-      |||,
-      tpuVmCreateSleepSeconds: 360,
-    },
-    podTemplate+:: {
-      spec+: {
-        containerMap+:: {
-          monitor: null,
-          train+: {
-            local scriptSettings = {
-              testCommand:
-                std.join(
-                  ' ',
-                  config.command,
-                ),
-            },
-            args: null,
-            // PyTorch tests are structured as bash scripts that run directly
-            // on the Cloud TPU VM instead of using docker images.
-            command: [
-              'bash',
-              '-c',
-              |||
-                set -x
-                set -u
-                ssh -i scripts/id_rsa -o StrictHostKeyChecking=no xl-ml-test@$(cat /scripts/tpu_ip) \
-                  'ls'
-                scp -i scripts/id_rsa /scripts/tpu_name xl-ml-test@$(cat /scripts/tpu_ip):~
-                ssh -i scripts/id_rsa -o StrictHostKeyChecking=no xl-ml-test@$(cat /scripts/tpu_ip) << 'TEST_SCRIPT_EOF'
-                  journalctl
-                  cat ~/tpu_name
-                  ls
-                  echo | gcloud compute config-ssh
-                  %(testCommand)s
-                TEST_SCRIPT_EOF
-                exit_code=$?
-                bash /scripts/cleanup.sh
-                exit $exit_code
-              ||| % scriptSettings,
-            ],
-          },
-        },
-      },
-    },
-  },
-  PyTorch1_9TpuVmPodTest:: experimental.BaseTpuVmMixin {
-    local config = self,
-    tpuSettings+: {
-      tpuVmStartupScript: |||
-        sudo bash /var/scripts/docker-login.sh
-        sudo docker rm libtpu || true
-        sudo docker create --name libtpu gcr.io/cloud-tpu-v2-images/libtpu:pytorch-1.9 "/bin/bash"
-        sudo docker cp libtpu:libtpu.so /lib
-        sudo pip3 uninstall --yes torch torch_xla torchvision numpy
-        sudo pip3 install https://storage.googleapis.com/tpu-pytorch/wheels/tpuvm/torch-1.9-cp38-cp38-linux_x86_64.whl https://storage.googleapis.com/tpu-pytorch/wheels/tpuvm/torch_xla-1.9-cp38-cp38-linux_x86_64.whl https://storage.googleapis.com/tpu-pytorch/wheels/tpuvm/torchvision-1.9-cp38-cp38-linux_x86_64.whl numpy
-        sudo pip3 install mkl mkl-include numpy
-        sudo ln -s /usr/local/lib/libmkl_intel_lp64.so.1 /usr/local/lib/libmkl_intel_lp64.so
-        sudo ln -s /usr/local/lib/libmkl_intel_thread.so.1 /usr/local/lib/libmkl_intel_thread.so
-        sudo ln -s /usr/local/lib/libmkl_core.so.1 /usr/local/lib/libmkl_core.so
-        sudo apt-get -y update
-        sudo apt-get install -y libomp5 nfs-common
-        cd /usr/share
-        git clone https://github.com/pytorch/pytorch.git -b release/1.9
-        cd pytorch
-        git clone https://github.com/pytorch/xla.git -b r1.9
-        export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4"
-        sudo mkdir /datasets
-        sudo mount 10.182.107.26:/pytorch_datasets /datasets
-        echo Done XLA startup script
-      |||,
-      tpuVmCreateSleepSeconds: 360,
-    },
-    podTemplate+:: {
-      spec+: {
-        containerMap+:: {
-          monitor: null,
-          train+: {
-            local scriptSettings = {
-              testCommand:
-                std.join(
-                  ' ',
-                  config.command,
-                ),
-            },
-            args: null,
-            // PyTorch tests are structured as bash scripts that run directly
-            // on the Cloud TPU VM instead of using docker images.
-            command: [
-              'bash',
-              '-c',
-              |||
-                set -x
-                set -u
-                ssh -i scripts/id_rsa -o StrictHostKeyChecking=no xl-ml-test@$(cat /scripts/tpu_ip) \
-                  'ls'
-                scp -i scripts/id_rsa /scripts/tpu_name xl-ml-test@$(cat /scripts/tpu_ip):~
-                ssh -i scripts/id_rsa -o StrictHostKeyChecking=no xl-ml-test@$(cat /scripts/tpu_ip) << 'TEST_SCRIPT_EOF'
-                  journalctl
-                  cat ~/tpu_name
-                  ls
-                  echo | gcloud compute config-ssh
-                  %(testCommand)s
-                TEST_SCRIPT_EOF
-                exit_code=$?
-                bash /scripts/cleanup.sh
-                exit $exit_code
-              ||| % scriptSettings,
-            ],
-          },
-        },
-      },
-    },
-  },
-  PyTorch1_10TpuVmPodTest:: experimental.BaseTpuVmMixin {
-    local config = self,
-    tpuSettings+: {
-      softwareVersion: 'v2-nightly',
-      tpuVmStartupScript: |||
-        sudo bash /var/scripts/docker-login.sh
-        sudo pip3 uninstall --yes torch torch_xla torchvision numpy
-        sudo pip3 install https://storage.googleapis.com/cloud-tpu-tpuvm-artifacts/wheels/libtpu-nightly/libtpu_nightly-0.1.dev20211013-py3-none-any.whl
-        sudo pip3 install torch==1.10.0
-        sudo pip3 install https://storage.googleapis.com/tpu-pytorch/wheels/tpuvm/torch_xla-1.10-cp38-cp38-linux_x86_64.whl
-        sudo pip3 install torchvision==0.11.1
-        sudo pip3 install mkl mkl-include numpy
-        sudo ln -s /usr/local/lib/libmkl_intel_lp64.so.1 /usr/local/lib/libmkl_intel_lp64.so
-        sudo ln -s /usr/local/lib/libmkl_intel_thread.so.1 /usr/local/lib/libmkl_intel_thread.so
-        sudo ln -s /usr/local/lib/libmkl_core.so.1 /usr/local/lib/libmkl_core.so
-        sudo apt-get -y update
-        sudo apt-get install -y libomp5 nfs-common
-        cd /usr/share
-        git clone https://github.com/pytorch/pytorch.git -b release/1.10
-        cd pytorch
-        git clone https://github.com/pytorch/xla.git -b r1.10
-        export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4"
-        sudo mkdir /datasets
-        sudo mount 10.182.107.26:/pytorch_datasets /datasets
-        echo Done XLA startup script
-      |||,
-      tpuVmCreateSleepSeconds: 360,
-    },
-    podTemplate+:: {
-      spec+: {
-        containerMap+:: {
-          monitor: null,
-          train+: {
-            local scriptSettings = {
-              testCommand:
-                std.join(
-                  ' ',
-                  config.command,
-                ),
-            },
-            args: null,
-            // PyTorch tests are structured as bash scripts that run directly
-            // on the Cloud TPU VM instead of using docker images.
-            command: [
-              'bash',
-              '-c',
-              |||
-                set -x
-                set -u
-                ssh -i scripts/id_rsa -o StrictHostKeyChecking=no xl-ml-test@$(cat /scripts/tpu_ip) \
-                  'ls'
-                scp -i scripts/id_rsa /scripts/tpu_name xl-ml-test@$(cat /scripts/tpu_ip):~
-                ssh -i scripts/id_rsa -o StrictHostKeyChecking=no xl-ml-test@$(cat /scripts/tpu_ip) << 'TEST_SCRIPT_EOF'
-                  journalctl
-                  cat ~/tpu_name
-                  ls
-                  echo | gcloud compute config-ssh
-                  %(testCommand)s
-                TEST_SCRIPT_EOF
-                exit_code=$?
-                bash /scripts/cleanup.sh
-                exit $exit_code
-              ||| % scriptSettings,
-            ],
-          },
-        },
-      },
-    },
-  },
-  PyTorch1_11TpuVmPodTest:: experimental.BaseTpuVmMixin {
-    local config = self,
-    tpuSettings+: {
-      softwareVersion: 'tpu-vm-pt-1.11',
-      tpuVmStartupScript: |||
-        sudo bash /var/scripts/docker-login.sh
-        sudo pip3 uninstall --yes torch torch_xla torchvision numpy
-        sudo pip3 install https://storage.googleapis.com/tpu-pytorch/wheels/tpuvm/torch-1.11-cp38-cp38-linux_x86_64.whl https://storage.googleapis.com/tpu-pytorch/wheels/tpuvm/torch_xla-1.11-cp38-cp38-linux_x86_64.whl https://storage.googleapis.com/tpu-pytorch/wheels/tpuvm/torchvision-1.11-cp38-cp38-linux_x86_64.whl
-        sudo pip3 install mkl mkl-include numpy
-        sudo ln -s /usr/local/lib/libmkl_intel_lp64.so.1 /usr/local/lib/libmkl_intel_lp64.so
-        sudo ln -s /usr/local/lib/libmkl_intel_thread.so.1 /usr/local/lib/libmkl_intel_thread.so
-        sudo ln -s /usr/local/lib/libmkl_core.so.1 /usr/local/lib/libmkl_core.so
-        sudo apt-get -y update
-        sudo apt-get install -y libomp5 nfs-common
-        gcloud compute config-ssh
-        cd /usr/share
-        git clone https://github.com/pytorch/pytorch.git -b r1.11
-        cd pytorch
-        git clone https://github.com/pytorch/xla.git -b release/1.11
-        export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4"
-        sudo mkdir /datasets
-        sudo mount 10.182.107.26:/pytorch_datasets /datasets
-        echo Done XLA startup script
-      |||,
-      tpuVmCreateSleepSeconds: 360,
-    },
-    podTemplate+:: {
-      spec+: {
-        containerMap+:: {
-          monitor: null,
-          train+: {
-            local scriptSettings = {
-              testCommand:
-                std.join(
-                  ' ',
-                  config.command,
-                ),
-            },
-            args: null,
-            // PyTorch tests are structured as bash scripts that run directly
-            // on the Cloud TPU VM instead of using docker images.
-            command: [
-              'bash',
-              '-c',
-              |||
-                set -x
-                set -u
-                ssh -i scripts/id_rsa -o StrictHostKeyChecking=no xl-ml-test@$(cat /scripts/tpu_ip) \
-                  'ls'
-                scp -i scripts/id_rsa /scripts/tpu_name xl-ml-test@$(cat /scripts/tpu_ip):~
-                ssh -i scripts/id_rsa -o StrictHostKeyChecking=no xl-ml-test@$(cat /scripts/tpu_ip) << 'TEST_SCRIPT_EOF'
-                  journalctl
-                  cat ~/tpu_name
-                  ls
-                  echo | gcloud compute config-ssh
-                  %(testCommand)s
-                TEST_SCRIPT_EOF
-                exit_code=$?
-                bash /scripts/cleanup.sh
-                exit $exit_code
-              ||| % scriptSettings,
-            ],
-          },
-        },
-      },
-    },
-  },
-
-
-  PyTorchNightlyTpuVmPodTest:: experimental.BaseTpuVmMixin {
-    local config = self,
-    tpuSettings+: {
-      softwareVersion: 'v2-nightly',
-      tpuVmStartupScript: |||
-        sudo bash /var/scripts/docker-login.sh
-        sudo pip3 uninstall --yes torch torch_xla torchvision numpy
-        sudo pip3 install https://storage.googleapis.com/tpu-pytorch/wheels/tpuvm/torch-nightly-cp38-cp38-linux_x86_64.whl https://storage.googleapis.com/tpu-pytorch/wheels/tpuvm/torch_xla-nightly-cp38-cp38-linux_x86_64.whl https://storage.googleapis.com/tpu-pytorch/wheels/tpuvm/torchvision-nightly-cp38-cp38-linux_x86_64.whl
-        sudo pip3 install mkl mkl-include numpy
-        sudo ln -s /usr/local/lib/libmkl_intel_lp64.so.1 /usr/local/lib/libmkl_intel_lp64.so
-        sudo ln -s /usr/local/lib/libmkl_intel_thread.so.1 /usr/local/lib/libmkl_intel_thread.so
-        sudo ln -s /usr/local/lib/libmkl_core.so.1 /usr/local/lib/libmkl_core.so
-        sudo apt-get -y update
-        sudo apt-get install -y libomp5 nfs-common
-        gcloud compute config-ssh
-        cd /usr/share
-        git clone https://github.com/pytorch/pytorch.git
-        cd pytorch
-        git clone https://github.com/pytorch/xla.git
-        export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4"
-        sudo mkdir /datasets
-        sudo mount 10.182.107.26:/pytorch_datasets /datasets
-        echo Done XLA startup script
-      |||,
-      tpuVmCreateSleepSeconds: 360,
-    },
-    podTemplate+:: {
-      spec+: {
-        containerMap+:: {
-          monitor: null,
-          train+: {
-            local scriptSettings = {
-              testCommand:
-                std.join(
-                  ' ',
-                  config.command,
-                ),
-            },
-            args: null,
-            // PyTorch tests are structured as bash scripts that run directly
-            // on the Cloud TPU VM instead of using docker images.
-            command: [
-              'bash',
-              '-c',
-              |||
-                set -x
-                set -u
-                ssh -i scripts/id_rsa -o StrictHostKeyChecking=no xl-ml-test@$(cat /scripts/tpu_ip) \
-                  'ls'
-                scp -i scripts/id_rsa /scripts/tpu_name xl-ml-test@$(cat /scripts/tpu_ip):~
-                ssh -i scripts/id_rsa -o StrictHostKeyChecking=no xl-ml-test@$(cat /scripts/tpu_ip) << 'TEST_SCRIPT_EOF'
-                  journalctl
-                  cat ~/tpu_name
-                  ls
-                  echo | gcloud compute config-ssh
-                  %(testCommand)s
-                TEST_SCRIPT_EOF
-                exit_code=$?
-                bash /scripts/cleanup.sh
-                exit $exit_code
-              ||| % scriptSettings,
-            ],
-          },
-        },
-      },
+      tpuVmXlaDistPrefix: null,
+      tpuVmMainCommandWorkers: 'all',
     },
   },
 }

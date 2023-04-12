@@ -13,17 +13,24 @@
 // limitations under the License.
 
 local common = import 'common.libsonnet';
+local mixins = import 'templates/mixins.libsonnet';
 local timeouts = import 'templates/timeouts.libsonnet';
 local tpus = import 'templates/tpus.libsonnet';
 local utils = import 'templates/utils.libsonnet';
 
 {
   local command_common = |||
-    git clone https://github.com/thisisalbertliang/training.git -b test-grid-integration unet3d_test
+    git clone https://github.com/pytorch-tpu/training.git unet3d_test
     pip3 install -r unet3d_test/image_segmentation/pytorch/requirements.txt
     pip3 install tqdm
 
-    python3 unet3d_test/image_segmentation/pytorch/main.py --data_dir /datasets/kits19 \
+    git clone https://github.com/neheller/kits19
+    cd kits19
+    pip3 install -r requirements.txt
+    python3 -m starter_code.get_imaging
+    cd -
+
+    python3 unet3d_test/image_segmentation/pytorch/main.py --data_dir /kits19 \
     --epochs 501 \
     --evaluate_every 250 \
     --start_eval_at 250 \
@@ -38,7 +45,8 @@ local utils = import 'templates/utils.libsonnet';
     --debug \
     --device xla
   |||,
-  local unet3d = common.PyTorchTest {
+  local unet3d = self.unet3d,
+  unet3d:: common.PyTorchTest {
     modelName: 'unet3d',
 
     volumeMap+: {
@@ -47,7 +55,8 @@ local utils = import 'templates/utils.libsonnet';
     cpu: '9.0',
     memory: '30Gi',
   },
-  local conv = common.Convergence {
+  local conv = self.conv,
+  conv:: common.Convergence {
     command: utils.scriptCommand(
       |||
         %(command_common)s \
@@ -61,10 +70,12 @@ local utils = import 'templates/utils.libsonnet';
       ||| % command_common
     ),
   },
-  local v3_8 = {
+  local v3_8 = self.v3_8,
+  v3_8:: {
     accelerator: tpus.v3_8,
   },
-  local tpuVm = common.PyTorchTpuVmMixin {
+  local tpuVm = self.tpuVm,
+  tpuVm:: common.PyTorchTpuVmMixin {
 
     tpuSettings+: {
 
@@ -78,6 +89,6 @@ local utils = import 'templates/utils.libsonnet';
 
   },
   configs: [
-    unet3d + v3_8 + conv + timeouts.Hours(25) + tpuVm,
+    unet3d + v3_8 + conv + timeouts.Hours(25) + tpuVm + mixins.Experimental,
   ],
 }
